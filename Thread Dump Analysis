@@ -1,0 +1,372 @@
+# Thread-Dump-Analysis-Bash-Script-
+Take Thread Dumps.
+++++++++++++++++++++++++++
+PID=624
+OUTDIR=/tmp/thread_dumps
+mkdir -p "$OUTDIR"
+
+for i in 1 2 3
+do
+    /u01/jdk/bin/jcmd "$PID" Thread.print -l \
+      > "$OUTDIR/threaddump_$i.txt" 2>&1
+
+    sleep 10
+done
+
+*************************************************************************************************************************
+
+
+#!/bin/bash
+
+# Deep Java / WebLogic Thread Dump Analyzer
+# Usage:
+#   bash thread_dumpAnalysis.sh Thread1.txt
+#   bash thread_dumpAnalysis.sh Thread1.txt report.txt
+
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: bash $0 <thread_dump_file> [report_file]"
+    exit 1
+fi
+
+DUMP="$1"
+REPORT="${2:-}"
+
+if [ ! -f "$DUMP" ] || [ ! -r "$DUMP" ]; then
+    echo "ERROR: File does not exist or is not readable: $DUMP"
+    exit 1
+fi
+
+if ! command -v gawk >/dev/null 2>&1; then
+    echo "ERROR: GNU awk (gawk) is required."
+    echo "RHEL: sudo dnf install gawk"
+    exit 1
+fi
+
+if [ -n "$REPORT" ] && [ "$DUMP" -ef "$REPORT" ]; then
+    echo "ERROR: Report file must differ from input dump."
+    exit 1
+fi
+
+if [ -n "$REPORT" ]; then
+    exec > "$REPORT" 2>&1
+fi
+
+echo
+echo "======================================================"
+echo "      DEEP JAVA / WEBLOGIC THREAD DUMP ANALYSIS"
+echo "======================================================"
+echo "Input file : $DUMP"
+echo "File size  : $(du -h "$DUMP" | awk '{print $1}')"
+echo "Analyzed   : $(date)"
+echo
+
+gawk '
+function reset_thread(    s) {
+    if (!active) return
+
+    total++
+
+    # Normalize state, for example WAITING (parking) -> WAITING
+    s = state
+    sub(/[[:space:]].*$/, "", s)
+
+    if (s == "RUNNABLE") runnable++
+    else if (s == "BLOCKED") blocked++
+    else if (s == "WAITING") waiting++
+    else if (s == "TIMED_WAITING") timed++
+    else unknown++
+
+    threadName[total] = name
+    threadState[total] = (s == "" ? "UNKNOWN" : s)
+    threadStack[total] = stackText
+    threadFirst[total] = firstStack
+    threadWaitLock[total] = waitLock
+    threadParkLock[total] = parkLock
+
+    if (name ~ /weblogic\.kernel/) wlKernel++
+    if (name ~ /ExecuteThread/) execute++
+    if (name ~ /LDAPConnThread/) ldap++
+    if (name ~ /TimerThread/) timer++
+
+    if (name ~ /ExecuteThread/ && s == "RUNNABLE")
+        executeRunnable++
+
+    if (name ~ /ExecuteThread/ && s == "BLOCKED")
+        executeBlocked++
+
+    if (name ~ /ExecuteThread/ &&
+        stackText ~ /ExecuteThread\.waitForRequest/)
+        idleExecute++
+
+    if (waitLock != "") {
+        monitorWaiters++
+        waitingOn[waitLock] = waitingOn[waitLock] total ","
+    }
+
+    if (parkLock != "")
+        parkedThreads++
+
+    if (s == "BLOCKED" || waitLock != "") {
+        blockedDetails[total] = 1
+    }
+
+    if (stackText ~ /oracle\.jdbc|weblogic\.jdbc|java\.sql/)
+        jdbcThreads++
+
+    if (stackText ~ /SocketDispatcher|SocketInputStream|SocketChannel/)
+        socketThreads++
+
+    if (stackText ~ /Unsafe\.park|LockSupport\.park|AbstractQueuedSynchronizer/)
+        parkThreads++
+
+    if (stackText ~ /EPoll\.wait|SelectorImpl\.select/)
+        selectorThreads++
+
+    if (stackText ~ /Object\.wait/)
+        objectWaitThreads++
+
+    if (stackText ~ /sun\.nio\.ch\.SocketDispatcher\.read0/)
+        socketReadThreads++
+
+    # Count repeated first stack frames
+    if (firstStack != "")
+        frameCount[firstStack]++
+
+    active = 0
+    name = ""
+    state = ""
+    stackText = ""
+    firstStack = ""
+    waitLock = ""
+    parkLock = ""
+}
+
+# Standard HotSpot Java thread header
+/^"/ {
+    reset_thread()
+
+    active = 1
+    name = $0
+    sub(/^"/, "", name)
+    sub(/".*$/, "", name)
+    next
+}
+
+active && /java\.lang\.Thread\.State:/ {
+    state = $0
+    sub(/^.*java\.lang\.Thread\.State:[[:space:]]*/, "", state)
+    sub(/[[:space:]]*\(.*$/, "", state)
+    sub(/,.*/, "", state)
+    next
+}
+
+active && /- waiting to lock/ {
+    if (match($0, /<0x[[:xdigit:]]+>/))
+        waitLock = substr($0, RSTART, RLENGTH)
+}
+
+active && /- parking to wait for/ {
+    if (match($0, /<0x[[:xdigit:]]+>/))
+        parkLock = substr($0, RSTART, RLENGTH)
+}
+
+active && /- locked </ {
+    if (match($0, /<0x[[:xdigit:]]+>/)) {
+        lockId = substr($0, RSTART, RLENGTH)
+        ownedLocks[lockId] = ownedLocks[lockId] total+1 ","
+    }
+}
+
+active && /^[[:space:]]+at / {
+    line = $0
+    sub(/^[[:space:]]+/, "", line)
+    stackText = stackText " " line
+
+    if (firstStack == "")
+        firstStack = line
+}
+
+# Deadlock reports from JVM thread dumps
+/Found one Java-level deadlock|Found [0-9]+ Java-level deadlocks|Java-level deadlock/ {
+    deadlockLines++
+    print "DEADLOCK REPORT: " $0
+}
+
+# WebLogic stuck-thread markers, not generic occurrences of "stuck"
+ /BEA-000337|has been busy for .*seconds|STUCK.*ExecuteThread/ {
+    stuckLines++
+    if (stuckLines <= 15)
+        stuckExample[stuckLines] = $0
+}
+
+/OutOfMemoryError|unable to create native thread|Java heap space/ {
+    errorLines++
+    if (errorLines <= 10)
+        errorExample[errorLines] = $0
+}
+
+END {
+    reset_thread()
+
+    print ""
+    print "================ THREAD STATE COUNTS ================"
+    print "Total threads parsed       : " total
+    print "RUNNABLE                   : " runnable
+    print "BLOCKED                    : " blocked
+    print "WAITING                    : " waiting
+    print "TIMED_WAITING              : " timed
+    print "Other / unknown            : " unknown
+
+    print ""
+    print "================ WEBLOGIC THREADS =================="
+    print "Kernel thread names        : " wlKernel
+    print "ExecuteThread names        : " execute
+    print "ExecuteThread RUNNABLE     : " executeRunnable
+    print "ExecuteThread BLOCKED      : " executeBlocked
+    print "ExecuteThread waiting for request: " idleExecute
+    print "LDAP connection threads    : " ldap
+    print "Timer threads              : " timer
+
+    print ""
+    print "================ STACK PATTERNS ===================="
+    print "Threads with JDBC stack    : " jdbcThreads
+    print "Threads with socket stack  : " socketThreads
+    print "Socket read stack clues    : " socketReadThreads
+    print "Threads using park/AQS     : " parkThreads
+    print "Selector/EPoll stack clues : " selectorThreads
+    print "Object.wait stack clues    : " objectWaitThreads
+
+    print ""
+    print "================ LOCK ANALYSIS ====================="
+    print "Threads waiting for monitor: " monitorWaiters
+    print "Threads parking with lock ID: " parkedThreads
+
+    print ""
+    print "Threads with explicit monitor waits:"
+    lockShown = 0
+    for (i = 1; i <= total; i++) {
+        if (threadWaitLock[i] != "") {
+            lockShown++
+            print "  Thread: " threadName[i]
+            print "  State : " threadState[i]
+            print "  Lock  : " threadWaitLock[i]
+
+            owners = ownedLocks[threadWaitLock[i]]
+            if (owners != "") {
+                sub(/,$/, "", owners)
+                n = split(owners, ids, ",")
+                for (j = 1; j <= n; j++) {
+                    id = ids[j]
+                    if (id ~ /^[0-9]+$/)
+                        print "  Possible owner: " threadName[id]
+                }
+            } else {
+                print "  Owner  : Not identified from explicit locked-monitor records"
+            }
+            print ""
+        }
+    }
+    if (lockShown == 0)
+        print "No explicit monitor-wait records found."
+
+    print "================ DEADLOCK / ERROR CHECK ============="
+    print "Deadlock report lines      : " deadlockLines
+    print "Stuck-thread indicator lines: " stuckLines
+    print "Memory/native-thread errors: " errorLines
+
+    if (stuckLines > 0) {
+        print ""
+        print "WebLogic stuck-thread examples:"
+        for (i = 1; i <= stuckLines && i <= 15; i++)
+            print "  " stuckExample[i]
+    }
+
+    if (errorLines > 0) {
+        print ""
+        print "Error examples:"
+        for (i = 1; i <= errorLines && i <= 10; i++)
+            print "  " errorExample[i]
+    }
+
+    print ""
+    print "================ THREAD DETAILS ===================="
+    detailCount = 0
+
+    for (i = 1; i <= total; i++) {
+        if (threadState[i] == "BLOCKED" ||
+            threadWaitLock[i] != "" ||
+            threadStack[i] ~ /oracle\.jdbc|weblogic\.jdbc|java\.sql/ ||
+            threadStack[i] ~ /SocketDispatcher\.read0/) {
+
+            if (detailCount < 30) {
+                print "Thread: " threadName[i]
+                print "State : " threadState[i]
+                if (threadWaitLock[i] != "")
+                    print "Waiting monitor: " threadWaitLock[i]
+                if (threadFirst[i] != "")
+                    print "First frame: " threadFirst[i]
+                print "--------------------------------------------"
+                detailCount++
+            }
+        }
+    }
+
+    print ""
+    print "================ RECOMMENDATIONS ==================="
+
+    if (total == 0)
+        print "WARNING: No standard Java thread headers parsed."
+
+    if (blocked > 0)
+        print "CHECK: Review BLOCKED threads and monitor owners."
+
+    if (executeBlocked > 0)
+        print "CHECK: WebLogic ExecuteThreads are BLOCKED."
+
+    if (idleExecute > 0)
+        print "INFO: Some ExecuteThreads are waiting for new requests; usually normal."
+
+    if (jdbcThreads > 0)
+        print "CHECK: Inspect JDBC stack traces and data-source/database response."
+
+    if (socketReadThreads > 0)
+        print "CHECK: Inspect socket peers, network response and timeout settings."
+
+    if (stuckLines > 0)
+        print "CHECK: Verify BEA-000337 messages in the WebLogic server log."
+
+    if (deadlockLines > 0)
+        print "WARNING: JVM reported a deadlock; inspect the complete deadlock section."
+    else
+        print "INFO: No explicit JVM deadlock report detected."
+
+    if (errorLines > 0)
+        print "WARNING: Investigate memory or native-thread errors."
+
+    if (runnable > 0)
+        print "NOTE: RUNNABLE does not prove high CPU; compare OS thread CPU usage."
+
+    print ""
+    print "================ TOP REPEATED FRAMES ================"
+    for (frame in frameCount)
+        print frameCount[frame], frame
+}
+' "$DUMP" | {
+    # Keep the main report and sort the repeated-frame section separately
+    # by using a temporary capture when desired.
+    cat
+}
+
+echo
+echo "======================================================"
+echo "                  ANALYSIS COMPLETE"
+echo "======================================================"
+
+if [ -n "$REPORT" ]; then
+    echo "Report saved to: $REPORT" >&2
+fi
+
+
+
